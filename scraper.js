@@ -7,8 +7,9 @@
  *   node scraper.js              # Start / resume full scrape
  *   node scraper.js --watch      # Hourly check for NEW cases only
  *   node scraper.js --reset      # Clear state and start fresh
- *   node scraper.js --page 42    # Scrape a single specific page
  *   node scraper.js --stats      # Show current state/progress
+ *
+ * Pagination: cursor-based (the site switched from ?page=N to opaque cursors)
  */
 
 "use strict";
@@ -72,16 +73,17 @@ function loadState() {
     catch { /* corrupted, start fresh */ }
   }
   return {
-    currentPage:     1,
-    totalPages:      null,
+    // Cursor-based pagination: null = start from beginning
+    nextCursor:      null,
+    done:            false,
     totalScraped:    0,
     csvFileIndex:    1,
     csvRowCount:     0,
-    completedPages:  [],
-    failedPages:     [],
     lastRunAt:       null,
     newestCreatedAt: null,
     totalCount:      null,
+    // Legacy fields kept for --stats display only
+    pagesScraped:    0,
   };
 }
 
@@ -227,13 +229,13 @@ function extractPageData(html) {
     return decodeObj(arr, raw);
   }).filter(Boolean);
 
-  // Pagination
-  const pageIdx  = arr.indexOf("page");
-  const hasMoreIdx = arr.indexOf("hasMore");
-  const page    = pageIdx > -1 ? arr[pageIdx + 1] : null;
-  const hasMore = hasMoreIdx > -1 ? arr[hasMoreIdx + 1] : false;
+  // Cursor-based pagination
+  const hasMoreIdx    = arr.indexOf("hasMore");
+  const nextCursorIdx = arr.indexOf("nextCursor");
+  const hasMore       = hasMoreIdx > -1    ? arr[hasMoreIdx + 1]    : false;
+  const nextCursor    = nextCursorIdx > -1 ? arr[nextCursorIdx + 1] : null;
 
-  return { persons, page, hasMore, totalCount };
+  return { persons, hasMore, nextCursor, totalCount };
 }
 
 // ─── Person flattening ───────────────────────────────────────────────────────
@@ -366,61 +368,65 @@ async function downloadImagesForPage(persons) {
 
 // ─── Core scraper ────────────────────────────────────────────────────────────
 
-async function scrapePage(pageNum) {
-  const pageUrl = `${CONFIG.baseUrl}/?page=${pageNum}`;
+// cursor=null → fetch first page; cursor=string → fetch next page
+async function scrapePage(cursor) {
+  const pageUrl = cursor
+    ? `${CONFIG.baseUrl}/?cursor=${encodeURIComponent(cursor)}`
+    : `${CONFIG.baseUrl}/`;
   const res = await fetchWithRetry(pageUrl);
   if (!res) return null;
   return extractPageData(res.body);
 }
 
-async function runFullScrape(state, opts = {}) {
+async function runFullScrape(state) {
   ensureDir(CONFIG.dataDir);
   ensureDir(CONFIG.imagesDir);
 
-  log("Starting full scrape…");
-  log(`State: page ${state.currentPage}, ${state.totalScraped} already scraped`);
+  if (state.done) {
+    log("Scrape already complete. Use --reset to start fresh, or --watch for new cases.");
+    printStats(state);
+    return;
+  }
 
-  let page = opts.singlePage || state.currentPage;
-  const singlePage = Boolean(opts.singlePage);
+  log("Starting / resuming full scrape…");
+  log(`Resuming from cursor: ${state.nextCursor ? state.nextCursor.slice(0, 30) + "…" : "beginning"}`);
+  log(`Already scraped: ${state.totalScraped} persons`);
+
+  let cursor = state.nextCursor; // null = start from page 1
 
   while (true) {
-    // Skip already-completed pages (unless doing a single-page run)
-    if (!singlePage && state.completedPages.includes(page)) {
-      log(`Page ${page} already done, skipping`);
-      page++;
-      continue;
-    }
-
-    log(`Fetching page ${page}${state.totalPages ? "/" + state.totalPages : ""}…`);
+    const label = cursor ? cursor.slice(0, 20) + "…" : "first page";
+    log(`Fetching [${label}]…`);
 
     let data = null;
     try {
-      data = await scrapePage(page);
+      data = await scrapePage(cursor);
     } catch (err) {
-      log(`  Failed page ${page}: ${err.message}`);
-      if (!state.failedPages.includes(page)) state.failedPages.push(page);
-      if (singlePage) break;
-      page++;
-      saveState(state);
-      await sleep(CONFIG.requestDelay * 3);
-      continue;
+      log(`  Request failed: ${err.message}. Retrying in 10s…`);
+      await sleep(10000);
+      continue; // retry same cursor
     }
 
     if (!data || data.persons.length === 0) {
-      log(`  No data on page ${page}, stopping`);
+      log("No data returned — scrape complete!");
+      state.done = true;
+      saveState(state);
       break;
     }
 
-    if (data.totalCount && !state.totalCount) {
+    if (data.totalCount) {
       state.totalCount = data.totalCount;
-      state.totalPages = Math.ceil(data.totalCount / CONFIG.personsPerPage);
-      log(`Total: ${data.totalCount} persons (~${state.totalPages} pages)`);
+      if (!state._loggedTotal) {
+        state._loggedTotal = true;
+        const est = Math.ceil(data.totalCount / CONFIG.personsPerPage);
+        log(`Site total: ${data.totalCount} persons (~${est} pages)`);
+      }
     }
 
     const flatPersons = data.persons.map(flattenPerson);
 
-    // Track newest record for watch mode
-    if (flatPersons.length > 0 && flatPersons[0].createdAt) {
+    // Track newest createdAt for watch mode (page 1 = newest, so only update if truly newer)
+    if (flatPersons.length > 0) {
       const newest = flatPersons.reduce((a, b) =>
         (a.createdAt > b.createdAt ? a : b), flatPersons[0]);
       if (!state.newestCreatedAt || newest.createdAt > state.newestCreatedAt) {
@@ -428,49 +434,26 @@ async function runFullScrape(state, opts = {}) {
       }
     }
 
-    // Write CSV
     appendToCSV(state, flatPersons);
+    state.pagesScraped = (state.pagesScraped || 0) + 1;
     log(`  Wrote ${flatPersons.length} persons → CSV #${state.csvFileIndex} (${state.totalScraped} total)`);
 
-    // Download images (non-blocking relative to CSV, but awaited per page)
     await downloadImagesForPage(data.persons);
 
-    if (!state.completedPages.includes(page)) state.completedPages.push(page);
-    state.currentPage = page + 1;
-    saveState(state);
-
-    if (singlePage) break;
-    if (!data.hasMore) {
+    // Advance cursor for next iteration
+    if (!data.hasMore || !data.nextCursor) {
       log("No more pages. Scrape complete!");
+      state.done = true;
+      state.nextCursor = null;
+      saveState(state);
       break;
     }
 
-    page++;
-    await sleep(CONFIG.requestDelay);
-  }
+    cursor = data.nextCursor;
+    state.nextCursor = cursor;
+    saveState(state);
 
-  // Retry failed pages once at the end
-  if (!singlePage && state.failedPages.length > 0) {
-    log(`\nRetrying ${state.failedPages.length} failed pages…`);
-    const toRetry = [...state.failedPages];
-    state.failedPages = [];
-    for (const fp of toRetry) {
-      log(`Re-fetching page ${fp}…`);
-      try {
-        const data = await scrapePage(fp);
-        if (data) {
-          appendToCSV(state, data.persons.map(flattenPerson));
-          await downloadImagesForPage(data.persons);
-          state.completedPages.push(fp);
-          log(`  Recovered page ${fp}: ${data.persons.length} persons`);
-        }
-      } catch (err) {
-        log(`  Still failing: ${fp} — ${err.message}`);
-        state.failedPages.push(fp);
-      }
-      saveState(state);
-      await sleep(CONFIG.requestDelay * 2);
-    }
+    await sleep(CONFIG.requestDelay);
   }
 
   printStats(state);
@@ -482,8 +465,30 @@ async function runWatch(state) {
   ensureDir(CONFIG.dataDir);
   ensureDir(CONFIG.imagesDir);
 
+  // If no checkpoint exists, fetch page 1 just to establish a baseline timestamp
+  // so we don't re-scrape tens of thousands of cases on the first watch run.
+  if (!state.newestCreatedAt) {
+    log("No checkpoint found — fetching page 1 to establish baseline…");
+    try {
+      const data = await scrapePage(1);
+      if (data && data.persons.length > 0) {
+        const newest = data.persons.reduce((a, b) =>
+          (a.createdAt > b.createdAt ? a : b), data.persons[0]);
+        state.newestCreatedAt = newest.createdAt;
+        saveState(state);
+        log(`Baseline set to ${state.newestCreatedAt}. New cases after this will be captured.`);
+      }
+    } catch (err) {
+      log(`Failed to establish baseline: ${err.message}`);
+    }
+  }
+
   log("Watch mode started — checking for new cases every hour");
-  log(`Last known newest case: ${state.newestCreatedAt || "unknown"}`);
+  log(`Checkpoint: ${state.newestCreatedAt}`);
+
+  // Safety cap: never paginate more than this many batches per check cycle.
+  // At 24 persons/batch this covers up to 2400 new cases per hour — plenty.
+  const MAX_WATCH_BATCHES = 100;
 
   while (true) {
     log("Checking for new cases…");
@@ -491,22 +496,22 @@ async function runWatch(state) {
     let newestFoundAt = state.newestCreatedAt;
 
     try {
-      let page = 1;
-      let keepPaging = true;
+      let batch = 1;
+      let watchCursor = null; // always start from page 1 (newest)
 
-      while (keepPaging) {
-        log(`  Scanning page ${page}…`);
-        const data = await scrapePage(page);
+      while (batch <= MAX_WATCH_BATCHES) {
+        log(`  Scanning batch ${batch}…`);
+        const data = await scrapePage(watchCursor);
 
+        // Empty page or parse failure → done
         if (!data || data.persons.length === 0) break;
 
-        // Update total count from first page
-        if (page === 1 && data.totalCount) {
+        if (batch === 1 && data.totalCount) {
           log(`  Site total: ${data.totalCount} persons`);
           state.totalCount = data.totalCount;
         }
 
-        // Filter only persons newer than what we've already seen
+        // Only persons strictly newer than our checkpoint
         const newPersons = state.newestCreatedAt
           ? data.persons.filter(p => p.createdAt > state.newestCreatedAt)
           : data.persons;
@@ -516,25 +521,27 @@ async function runWatch(state) {
           await downloadImagesForPage(newPersons);
           totalNew += newPersons.length;
 
-          // Track the newest createdAt found in this batch
           const batchNewest = newPersons.reduce((a, b) =>
             (a.createdAt > b.createdAt ? a : b), newPersons[0]);
           if (!newestFoundAt || batchNewest.createdAt > newestFoundAt) {
             newestFoundAt = batchNewest.createdAt;
           }
 
-          log(`  Page ${page}: ${newPersons.length} new cases`);
+          log(`  Batch ${page}: ${newPersons.length} new case(s)`);
         }
 
-        // Stop paginating if this page had cases older than our checkpoint
-        // (means we've caught up to previously-seen data)
-        const hasOldCases = newPersons.length < data.persons.length;
-        if (hasOldCases || !data.hasMore) {
-          keepPaging = false;
-        } else {
-          page++;
-          await sleep(CONFIG.requestDelay);
-        }
+        // This page contained at least one old case → we've caught up
+        const reachedOldData = newPersons.length < data.persons.length;
+        if (reachedOldData || !data.hasMore || !data.nextCursor) break;
+
+        watchCursor = data.nextCursor;
+
+        batch++;
+        await sleep(CONFIG.requestDelay);
+      }
+
+      if (batch > MAX_WATCH_BATCHES) {
+        log(`  Hit batch cap (${MAX_WATCH_BATCHES}). Run full scrape to catch up further.`);
       }
 
       if (totalNew > 0) {
@@ -569,12 +576,12 @@ function printStats(state) {
   console.log("═══════════════════════════════════════");
   console.log(`  Total scraped:    ${state.totalScraped}`);
   console.log(`  Site total:       ${state.totalCount || "unknown"}`);
-  console.log(`  Pages done:       ${state.completedPages.length}`);
-  console.log(`  Pages failed:     ${state.failedPages.length}`);
-  console.log(`  Current page:     ${state.currentPage}`);
+  console.log(`  Batches scraped:  ${state.pagesScraped || 0}`);
+  console.log(`  Status:           ${state.done ? "complete" : "in progress"}`);
   console.log(`  CSV files:        ${csvFiles}`);
   console.log(`  Images:           ${imgCount}`);
   console.log(`  Last run:         ${state.lastRunAt || "never"}`);
+  console.log(`  Newest case:      ${state.newestCreatedAt || "unknown"}`);
   console.log("═══════════════════════════════════════\n");
 }
 
@@ -582,11 +589,9 @@ function printStats(state) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const watchMode  = args.includes("--watch");
-  const resetMode  = args.includes("--reset");
-  const statsMode  = args.includes("--stats");
-  const pageArg    = args.indexOf("--page");
-  const singlePage = pageArg > -1 ? parseInt(args[pageArg + 1], 10) : null;
+  const watchMode = args.includes("--watch");
+  const resetMode = args.includes("--reset");
+  const statsMode = args.includes("--stats");
 
   ensureDir(CONFIG.dataDir);
   ensureDir(CONFIG.imagesDir);
@@ -609,13 +614,7 @@ async function main() {
     return;
   }
 
-  if (singlePage) {
-    log(`Scraping single page ${singlePage}…`);
-    await runFullScrape(state, { singlePage });
-    return;
-  }
-
-  // Full scrape (default)
+  // Full scrape (default) — resumes from saved cursor automatically
   await runFullScrape(state);
 }
 
