@@ -406,7 +406,7 @@ async function runFullScrape(state, opts = {}) {
       continue;
     }
 
-    if (!data) {
+    if (!data || data.persons.length === 0) {
       log(`  No data on page ${page}, stopping`);
       break;
     }
