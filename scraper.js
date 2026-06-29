@@ -486,38 +486,65 @@ async function runWatch(state) {
   log(`Last known newest case: ${state.newestCreatedAt || "unknown"}`);
 
   while (true) {
-    log("Checking for new cases on page 1…");
+    log("Checking for new cases…");
+    let totalNew = 0;
+    let newestFoundAt = state.newestCreatedAt;
+
     try {
-      const data = await scrapePage(1);
-      if (data && data.persons.length > 0) {
+      let page = 1;
+      let keepPaging = true;
+
+      while (keepPaging) {
+        log(`  Scanning page ${page}…`);
+        const data = await scrapePage(page);
+
+        if (!data || data.persons.length === 0) break;
+
+        // Update total count from first page
+        if (page === 1 && data.totalCount) {
+          log(`  Site total: ${data.totalCount} persons`);
+          state.totalCount = data.totalCount;
+        }
+
+        // Filter only persons newer than what we've already seen
         const newPersons = state.newestCreatedAt
           ? data.persons.filter(p => p.createdAt > state.newestCreatedAt)
           : data.persons;
 
         if (newPersons.length > 0) {
-          log(`Found ${newPersons.length} new case(s)!`);
-          const flatNew = newPersons.map(flattenPerson);
-          appendToCSV(state, flatNew);
+          appendToCSV(state, newPersons.map(flattenPerson));
           await downloadImagesForPage(newPersons);
+          totalNew += newPersons.length;
 
-          // Update newest timestamp
-          const newest = newPersons.reduce((a, b) =>
+          // Track the newest createdAt found in this batch
+          const batchNewest = newPersons.reduce((a, b) =>
             (a.createdAt > b.createdAt ? a : b), newPersons[0]);
-          state.newestCreatedAt = newest.createdAt;
-          saveState(state);
+          if (!newestFoundAt || batchNewest.createdAt > newestFoundAt) {
+            newestFoundAt = batchNewest.createdAt;
+          }
 
-          log(`Wrote ${newPersons.length} new records to CSV #${state.csvFileIndex}`);
-        } else {
-          log("No new cases since last check.");
+          log(`  Page ${page}: ${newPersons.length} new cases`);
         }
 
-        // Also update total count
-        if (data.totalCount) {
-          log(`Site total: ${data.totalCount} persons`);
-          state.totalCount = data.totalCount;
-          saveState(state);
+        // Stop paginating if this page had cases older than our checkpoint
+        // (means we've caught up to previously-seen data)
+        const hasOldCases = newPersons.length < data.persons.length;
+        if (hasOldCases || !data.hasMore) {
+          keepPaging = false;
+        } else {
+          page++;
+          await sleep(CONFIG.requestDelay);
         }
       }
+
+      if (totalNew > 0) {
+        state.newestCreatedAt = newestFoundAt;
+        saveState(state);
+        log(`Done — wrote ${totalNew} new case(s) total`);
+      } else {
+        log("No new cases since last check.");
+      }
+
     } catch (err) {
       log(`Watch check failed: ${err.message}`);
     }
